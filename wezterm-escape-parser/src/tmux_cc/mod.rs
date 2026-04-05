@@ -223,6 +223,11 @@ fn parse_line(line: &[u8]) -> Result<Event> {
     let pair = pairs.next().ok_or_else(|| format_err!("no pairs!?"))?;
     match pair.as_rule() {
         // Tmux generic rules
+        Rule::empty => {
+            Ok(Event::Message {
+                message: "empty line".to_string(),
+            })
+        }
         Rule::begin => {
             let (timestamp, number, flags) = parse_guard(pair.into_inner())?;
             Ok(Event::Begin {
@@ -736,6 +741,7 @@ fn parse_layout_inner(
     while let Some(pair) = pairs.next() {
         let rule = pair.as_rule();
         match rule {
+            Rule::empty => {}
             Rule::layout_split_horizontal | Rule::layout_split_vertical => {
                 let mut pairs_inner = pair.into_inner();
                 let pair = pairs_inner

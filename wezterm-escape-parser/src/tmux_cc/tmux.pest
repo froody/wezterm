@@ -17,6 +17,8 @@ begin = { "%begin " ~ number ~ " " ~ number ~ " " ~ number }
 end = { "%end " ~ number ~ " " ~ number ~ " " ~ number }
 error = { "%error " ~ number ~ " " ~ number ~ " " ~ number }
 
+empty = { "%" }
+
 // Tmux specific rules
 client_session_changed = { "%client-session-changed " ~ client_name ~ " " ~ session_id ~ " " ~any_text }
 client_detached = { "%client-detached " ~ client_name }
