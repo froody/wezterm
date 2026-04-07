@@ -582,7 +582,12 @@ impl ClientDomain {
                     remote_panes_to_forget.remove(&entry.pane_id);
                     if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
                         match mux.get_pane(pane_id) {
-                            Some(pane) => pane,
+                            Some(pane) => {
+                                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                                    client_pane.set_dimensions_from_server(entry.size);
+                                }
+                                pane
+                            }
                             None => {
                                 // We likely decided that we hit EOF on the tab and
                                 // removed it from the mux.  Let's add it back, but

@@ -250,6 +250,30 @@ impl ClientPane {
     pub fn ignore_next_kill(&self) {
         *self.ignore_next_kill.lock() = true;
     }
+
+    /// Updates the local dimensions based on the server's state without
+    /// triggering a Resize PDU to be sent back to the server.
+    pub fn set_dimensions_from_server(&self, size: TerminalSize) {
+        let render = self.renderable.lock();
+        let mut inner = render.inner.borrow_mut();
+
+        let cols = size.cols as usize;
+        let rows = size.rows as usize;
+
+        if inner.dimensions.cols != cols
+            || inner.dimensions.viewport_rows != rows
+            || inner.dimensions.pixel_width != size.pixel_width
+            || inner.dimensions.pixel_height != size.pixel_height
+        {
+            inner.dimensions.cols = cols;
+            inner.dimensions.viewport_rows = rows;
+            inner.dimensions.pixel_width = size.pixel_width;
+            inner.dimensions.pixel_height = size.pixel_height;
+
+            // Invalidate any cached rows on a resize
+            inner.make_all_stale();
+        }
+    }
 }
 
 #[async_trait(?Send)]
