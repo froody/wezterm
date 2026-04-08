@@ -143,7 +143,13 @@ impl AgentProxy {
         // this stream.
 
         let mut clients = Mux::get().iter_clients();
-        clients.retain(|info| info.client_id.ssh_auth_sock.is_some());
+        clients.retain(|info| {
+            if let Some(sock_path) = &info.client_id.ssh_auth_sock {
+                std::path::Path::new(sock_path).exists()
+            } else {
+                false
+            }
+        });
 
         clients.sort_by(|a, b| {
             // The biggest last_input time is most recent, so it sorts sooner.
