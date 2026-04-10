@@ -210,12 +210,22 @@ impl AgentProxy {
             }
             None => {
                 if self.current_target.write().take().is_some() {
-                    log::trace!("Updating agent to be bogus");
-                    if let Err(err) = update_symlink(".", &self.sock_path) {
-                        log::error!(
-                            "Problem updating {} -> .: {err:#}",
-                            self.sock_path.display()
-                        );
+                    if let Some(inherited) = Self::default_ssh_auth_sock() {
+                        log::trace!("Reverting agent to default {inherited}");
+                        if let Err(err) = update_symlink(&inherited, &self.sock_path) {
+                            log::error!(
+                                "Problem updating {} -> {inherited}: {err:#}",
+                                self.sock_path.display()
+                            );
+                        }
+                    } else {
+                        log::trace!("Updating agent to be bogus");
+                        if let Err(err) = update_symlink(".", &self.sock_path) {
+                            log::error!(
+                                "Problem updating {} -> .: {err:#}",
+                                self.sock_path.display()
+                            );
+                        }
                     }
                 }
             }

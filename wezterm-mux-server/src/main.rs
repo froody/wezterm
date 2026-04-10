@@ -99,9 +99,6 @@ fn run() -> anyhow::Result<()> {
     let config = config::configuration();
 
     config.update_ulimit()?;
-    if let Some(value) = &config.default_ssh_auth_sock {
-        std::env::set_var("SSH_AUTH_SOCK", value);
-    }
 
     #[cfg(unix)]
     let mut pid_file = None;
@@ -185,6 +182,10 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Store SSH_AUTH_SOCK before we potentially remove it, so that
+    // AgentProxy can pick it up as a default if needed.
+    let initial_ssh_auth_sock = std::env::var("SSH_AUTH_SOCK").ok();
+
     // Remove some environment variables that aren't super helpful or
     // that are potentially misleading when we're starting up the
     // server.
@@ -202,6 +203,13 @@ fn run() -> anyhow::Result<()> {
     }
     for name in &config::configuration().mux_env_remove {
         std::env::remove_var(name);
+    }
+
+    if let Some(value) = &config.default_ssh_auth_sock {
+        std::env::set_var("SSH_AUTH_SOCK", value);
+    } else if let Some(value) = initial_ssh_auth_sock {
+        // Restore it for AgentProxy::new to find
+        std::env::set_var("SSH_AUTH_SOCK", value);
     }
 
     wezterm_blob_leases::register_storage(Arc::new(
