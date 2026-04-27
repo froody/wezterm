@@ -112,7 +112,7 @@ pub struct Mux {
     identity: RwLock<Option<Arc<ClientId>>>,
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
     main_thread_id: std::thread::ThreadId,
-    agent: Option<AgentProxy>,
+    pub agent: Option<AgentProxy>,
 }
 
 const BUFSIZE: usize = 1024 * 1024;

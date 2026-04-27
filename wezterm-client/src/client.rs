@@ -1,3 +1,4 @@
+use crate::agent;
 use crate::domain::{ClientDomain, ClientDomainConfig};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail, Context};
@@ -43,10 +44,15 @@ struct Timeout;
 #[error("ChannelSendError")]
 struct ChannelSendError;
 
-enum ReaderMessage {
+pub(crate) enum ReaderMessage {
     SendPdu {
         pdu: Pdu,
         promise: Sender<anyhow::Result<Pdu>>,
+    },
+    /// Send a PDU with serial=0 and no expected response. Used for
+    /// unilateral traffic such as agent-channel data.
+    SendPduUnsolicited {
+        pdu: Pdu,
     },
     Readable,
 }
@@ -341,16 +347,24 @@ fn client_thread(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
     rx: &mut Receiver<ReaderMessage>,
+    sender: &Sender<ReaderMessage>,
 ) -> anyhow::Result<()> {
-    block_on(client_thread_async(reconnectable, local_domain_id, rx))
+    block_on(client_thread_async(
+        reconnectable,
+        local_domain_id,
+        rx,
+        sender,
+    ))
 }
 
 async fn client_thread_async(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
     rx: &mut Receiver<ReaderMessage>,
+    sender: &Sender<ReaderMessage>,
 ) -> anyhow::Result<()> {
     let mut next_serial = 1u64;
+    let agent_state = agent::ClientAgentState::new(sender.clone());
 
     struct Promises {
         map: HashMap<u64, Sender<anyhow::Result<Pdu>>>,
@@ -393,6 +407,12 @@ async fn client_thread_async(
                     .context("encoding a PDU to send to the server")?;
                 stream.flush().await.context("flushing PDU to server")?;
             }
+            Ok(ReaderMessage::SendPduUnsolicited { pdu }) => {
+                pdu.encode_async(&mut stream, 0)
+                    .await
+                    .context("encoding an unsolicited PDU to send to the server")?;
+                stream.flush().await.context("flushing PDU to server")?;
+            }
             Ok(ReaderMessage::Readable) => {
                 match Pdu::decode_async(&mut stream, Some(next_serial)).await {
                     Ok(decoded) => {
@@ -402,12 +422,18 @@ async fn client_thread_async(
                             decoded.pdu.pdu_name()
                         );
                         if decoded.serial == 0 {
-                            process_unilateral(local_domain_id, decoded)
-                                .context("processing unilateral PDU from server")
-                                .map_err(|e| {
-                                    log::error!("process_unilateral: {:?}", e);
-                                    e
-                                })?;
+                            match agent_state.try_dispatch(decoded.pdu) {
+                                None => {}
+                                Some(pdu) => {
+                                    let decoded = DecodedPdu { serial: 0, pdu };
+                                    process_unilateral(local_domain_id, decoded)
+                                        .context("processing unilateral PDU from server")
+                                        .map_err(|e| {
+                                            log::error!("process_unilateral: {:?}", e);
+                                            e
+                                        })?;
+                                }
+                            }
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
                                 return Err(NotReconnectableError::ClientWasDestroyed.into());
@@ -1053,13 +1079,19 @@ impl Client {
         let (sender, mut receiver) = unbounded();
         let client_id = ClientId::new();
 
+        let sender_for_thread = sender.clone();
         thread::spawn(move || {
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
             const MAX_INTERVAL: Duration = Duration::from_secs(10);
 
             let mut backoff = BASE_INTERVAL;
             loop {
-                if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
+                if let Err(e) = client_thread(
+                    &mut reconnectable,
+                    local_domain_id,
+                    &mut receiver,
+                    &sender_for_thread,
+                ) {
                     if !reconnectable.reconnectable() || local_domain_id.is_none() {
                         log::debug!("client thread ended: {}", e);
                         break;

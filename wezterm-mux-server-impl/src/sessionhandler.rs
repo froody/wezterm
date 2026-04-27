@@ -208,8 +208,31 @@ impl Drop for SessionHandler {
         if let Some(client_id) = self.client_id.take() {
             let mux = Mux::get();
             mux.unregister_client(&client_id);
+            if let Some(agent) = &mux.agent {
+                agent.unregister_client(&client_id);
+            }
         }
     }
+}
+
+/// Wrap a PduSender into the transport-agnostic AgentSender that
+/// AgentProxy in the mux crate can drive. Translates AgentMessage into
+/// the corresponding wire PDUs.
+fn agent_sender_for(sender: PduSender) -> mux::ssh_agent::AgentSender {
+    Arc::new(move |msg| {
+        let pdu = match msg {
+            mux::ssh_agent::AgentMessage::Open { channel_id } => {
+                Pdu::OpenAgentChannel(OpenAgentChannel { channel_id })
+            }
+            mux::ssh_agent::AgentMessage::Data { channel_id, data } => {
+                Pdu::AgentChannelData(AgentChannelData { channel_id, data })
+            }
+            mux::ssh_agent::AgentMessage::Close { channel_id } => {
+                Pdu::CloseAgentChannel(CloseAgentChannel { channel_id })
+            }
+        };
+        sender.send(DecodedPdu { pdu, serial: 0 }).ok();
+    })
 }
 
 impl SessionHandler {
@@ -320,13 +343,43 @@ impl SessionHandler {
 
                     let client_id = Arc::new(client_id);
                     self.client_id.replace(client_id.clone());
+                    let agent_sender = if client_id.ssh_agent_forward {
+                        Some(agent_sender_for(self.to_write_tx.clone()))
+                    } else {
+                        None
+                    };
+                    let cid_for_register = client_id.clone();
                     spawn_into_main_thread(async move {
                         let mux = Mux::get();
-                        mux.register_client(client_id);
+                        mux.register_client(cid_for_register.clone());
+                        if let (Some(sender), Some(agent)) = (agent_sender, mux.agent.as_ref()) {
+                            agent.register_client((*cid_for_register).clone(), sender);
+                        }
                     })
                     .detach();
                 }
                 send_response(Ok(Pdu::UnitResponse(UnitResponse {})))
+            }
+            Pdu::AgentChannelData(AgentChannelData { channel_id, data }) => {
+                if let Some(mux) = Mux::try_get() {
+                    if let Some(agent) = &mux.agent {
+                        agent.handle_inbound_data(channel_id, &data);
+                    }
+                }
+                // Unilateral: no response.
+            }
+            Pdu::CloseAgentChannel(CloseAgentChannel { channel_id }) => {
+                if let Some(mux) = Mux::try_get() {
+                    if let Some(agent) = &mux.agent {
+                        agent.handle_inbound_close(channel_id);
+                    }
+                }
+                // Unilateral: no response.
+            }
+            Pdu::OpenAgentChannel(_) => {
+                // OpenAgentChannel only flows server -> client.
+                // Receiving it from a client is a protocol violation;
+                // ignore silently rather than echoing an error back.
             }
             Pdu::SetFocusedPane(SetFocusedPane { pane_id }) => {
                 let client_id = self.client_id.clone();

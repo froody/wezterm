@@ -21,11 +21,22 @@ pub struct ClientId {
     pub epoch: u64,
     pub id: usize,
     pub ssh_auth_sock: Option<String>,
+    /// True when this client is willing to bridge its local SSH agent
+    /// to the server via OpenAgentChannel/AgentChannelData PDUs.
+    /// Proxies (netcat-style) leave this false; only the interactive
+    /// client at the human's keyboard sets it to true.
+    #[serde(default)]
+    pub ssh_agent_forward: bool,
 }
 
 impl ClientId {
     pub fn new() -> Self {
         let id = CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+        let ssh_auth_sock = crate::AgentProxy::default_ssh_auth_sock();
+        let ssh_agent_forward = ssh_auth_sock
+            .as_ref()
+            .map(|p| std::path::Path::new(p).exists())
+            .unwrap_or(false);
         Self {
             hostname: hostname::get()
                 .map(|s| s.to_string_lossy().to_string())
@@ -34,7 +45,8 @@ impl ClientId {
             pid: unsafe { libc::getpid() as u32 },
             epoch: *EPOCH,
             id,
-            ssh_auth_sock: crate::AgentProxy::default_ssh_auth_sock(),
+            ssh_auth_sock,
+            ssh_agent_forward,
         }
     }
 }

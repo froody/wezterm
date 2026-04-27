@@ -1,48 +1,54 @@
 use crate::{ClientId, Mux};
-use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::RwLock;
-#[cfg(unix)]
-use std::os::unix::fs::symlink as symlink_file;
-#[cfg(windows)]
-use std::os::windows::fs::symlink_file;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// AgentProxy manages an agent.PID symlink in the wezterm runtime
-/// directory.
-/// The intent is to maintain the symlink and have it point to the
-/// appropriate ssh agent socket path for the most recently active
-/// mux client.
-///
-/// Why symlink rather than running an agent proxy socket of our own?
-/// Some agent implementations use low level unix socket operations
-/// to decide whether the client process is allowed to consume
-/// the agent or not, and us sitting in the middle breaks that.
+/// AgentProxy listens on a unix socket in the wezterm runtime
+/// directory (`agent.PID`). When a process on the server side
+/// connects to it, AgentProxy picks the most recently active
+/// agent-capable client and bridges the connection's traffic to
+/// that client over the wezterm protocol via OpenAgentChannel /
+/// AgentChannelData / CloseAgentChannel PDUs. The client at the
+/// far end of the wezterm connection then proxies the bytes to
+/// its local SSH agent socket.
 ///
 /// As a further complication, when a wezterm proxy client is
 /// present, both the proxy and the mux instance inside a gui
 /// tend to be updated together, with the gui often being
 /// touched last.
 ///
-/// To deal with that we de-bounce input events and weight
-/// proxy clients higher so that we can avoid thrashing
-/// between gui and proxy.
-///
-/// The consequence of this is that there is 100ms of artificial
-/// latency to detect a change in the active client.
-/// This number was selected because it is unlike for a human
-/// to be able to switch devices that quickly.
-///
-/// How is this used? The Mux::client_had_input function
-/// will call AgentProxy::update_target to signal when
-/// the active client may have changed.
+/// To deal with that we weight proxy clients higher so that we
+/// can avoid thrashing between gui and proxy.
+
+/// Abstract message produced by AgentProxy and consumed by the
+/// per-session transport in the mux server. Lives in `mux` so the
+/// AgentProxy can be transport-agnostic; mux-server-impl translates
+/// these into wire PDUs.
+pub enum AgentMessage {
+    Open { channel_id: u64 },
+    Data { channel_id: u64, data: Vec<u8> },
+    Close { channel_id: u64 },
+}
+
+pub type AgentSender = Arc<dyn Fn(AgentMessage) + Send + Sync>;
+
+struct ChannelEntry {
+    /// Used to write data inbound from the remote client back into
+    /// the local connection.
+    write_half: Mutex<UnixStream>,
+    client_id: Arc<ClientId>,
+}
 
 pub struct AgentProxy {
     sock_path: PathBuf,
-    current_target: RwLock<Option<Arc<ClientId>>>,
-    sender: SyncSender<()>,
+    senders: RwLock<HashMap<ClientId, AgentSender>>,
+    channels: RwLock<HashMap<u64, ChannelEntry>>,
+    next_channel_id: AtomicU64,
 }
 
 impl Drop for AgentProxy {
@@ -51,54 +57,35 @@ impl Drop for AgentProxy {
     }
 }
 
-fn update_symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> anyhow::Result<()> {
-    let original = original.as_ref();
-    let link = link.as_ref();
-
-    match symlink_file(original, link) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                std::fs::remove_file(link)
-                    .with_context(|| format!("failed to remove {}", link.display()))?;
-                symlink_file(original, link).with_context(|| {
-                    format!(
-                        "failed to create symlink {} -> {}: {err:#}",
-                        link.display(),
-                        original.display()
-                    )
-                })
-            } else {
-                anyhow::bail!(
-                    "failed to create symlink {} -> {}: {err:#}",
-                    link.display(),
-                    original.display()
-                );
-            }
-        }
-    }
-}
-
 impl AgentProxy {
     pub fn new() -> Self {
         let pid = unsafe { libc::getpid() };
         let sock_path = config::RUNTIME_DIR.join(format!("agent.{pid}"));
 
-        if let Some(inherited) = Self::default_ssh_auth_sock() {
-            if let Err(err) = update_symlink(&inherited, &sock_path) {
-                log::error!("failed to set {sock_path:?} to initial inherited SSH_AUTH_SOCK value of {inherited:?}: {err:#}");
+        // Remove any stale socket left from a previous run with the
+        // same pid (rare but possible after a crash).
+        std::fs::remove_file(&sock_path).ok();
+
+        let proxy = Self {
+            sock_path: sock_path.clone(),
+            senders: RwLock::new(HashMap::new()),
+            channels: RwLock::new(HashMap::new()),
+            next_channel_id: AtomicU64::new(1),
+        };
+
+        match UnixListener::bind(&sock_path) {
+            Ok(listener) => {
+                std::thread::spawn(move || Self::accept_loop(listener));
+            }
+            Err(err) => {
+                log::error!(
+                    "failed to bind agent socket at {}: {err:#}",
+                    sock_path.display()
+                );
             }
         }
 
-        let (sender, receiver) = sync_channel(16);
-
-        std::thread::spawn(move || Self::process_updates(receiver));
-
-        Self {
-            sock_path,
-            current_target: RwLock::new(None),
-            sender,
-        }
+        proxy
     }
 
     pub fn default_ssh_auth_sock() -> Option<String> {
@@ -112,60 +99,83 @@ impl AgentProxy {
         &self.sock_path
     }
 
-    pub fn update_target(&self) {
-        // If the send fails, the channel is most likely
-        // full, which means that the updater thread is
-        // going to observe the now-current state when
-        // it wakes up, so we needn't try any harder
-        self.sender.try_send(()).ok();
+    /// `update_target` exists for compatibility with the previous
+    /// symlink-based design which was driven by client input events.
+    /// In the channel-based design we pick the target lazily at the
+    /// moment a connection is accepted, so this is a no-op.
+    pub fn update_target(&self) {}
+
+    /// Register a transport sink for a client that has indicated
+    /// it can forward an agent (ssh_agent_forward = true).
+    pub fn register_client(&self, client_id: ClientId, sender: AgentSender) {
+        self.senders.write().insert(client_id, sender);
     }
 
-    fn process_updates(receiver: Receiver<()>) {
-        while let Ok(_) = receiver.recv() {
-            // De-bounce multiple input events so that we don't quickly
-            // thrash between the host and proxy value
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            while receiver.try_recv().is_ok() {}
+    pub fn unregister_client(&self, client_id: &ClientId) {
+        self.senders.write().remove(client_id);
+        // Drop any channels that were routed to this client; the
+        // accompanying UnixStream close will signal EOF to the local
+        // process that connected to the agent socket.
+        let mut channels = self.channels.write();
+        channels.retain(|_, entry| entry.client_id.as_ref() != client_id);
+    }
 
-            if let Some(mux) = Mux::try_get() {
-                if let Some(agent) = &mux.agent {
-                    agent.update_now();
+    /// Inbound from a remote client: write `data` to the local
+    /// connection associated with `channel_id`. Empty `data` is EOF.
+    pub fn handle_inbound_data(&self, channel_id: u64, data: &[u8]) {
+        let channels = self.channels.read();
+        let Some(entry) = channels.get(&channel_id) else {
+            return;
+        };
+        let mut stream = entry.write_half.lock();
+        if data.is_empty() {
+            // Half-close: shut down the write side so the local
+            // process sees EOF. The reader thread on this side will
+            // wrap up when its read returns 0.
+            stream.shutdown(std::net::Shutdown::Write).ok();
+            return;
+        }
+        if let Err(err) = stream.write_all(data) {
+            log::debug!("agent channel {channel_id} write failed: {err:#}");
+            drop(stream);
+            drop(channels);
+            self.close_channel(channel_id, true);
+        }
+    }
+
+    /// Inbound from a remote client: close the channel.
+    pub fn handle_inbound_close(&self, channel_id: u64) {
+        self.close_channel(channel_id, false);
+    }
+
+    fn close_channel(&self, channel_id: u64, notify_remote: bool) {
+        let entry = self.channels.write().remove(&channel_id);
+        if let Some(entry) = entry {
+            // Tear down both halves of the unix socket so the local
+            // process sees EOF *and* the read pump thread exits.
+            entry.write_half.lock().shutdown(std::net::Shutdown::Both).ok();
+            if notify_remote {
+                let senders = self.senders.read();
+                if let Some(sender) = senders.get(entry.client_id.as_ref()) {
+                    sender(AgentMessage::Close { channel_id });
                 }
             }
         }
     }
 
-    fn update_now(&self) {
-        // Get list of clients from mux
-        // Order by most recent activity
-        // Take first one with auth sock -> that's the path
-        // If we find none, then we print an error and drop
-        // this stream.
-
+    fn pick_target_client(&self) -> Option<Arc<ClientId>> {
         let mut clients = Mux::get().iter_clients();
-        clients.retain(|info| {
-            if let Some(sock_path) = &info.client_id.ssh_auth_sock {
-                std::path::Path::new(sock_path).exists()
-            } else {
-                false
-            }
-        });
+        clients.retain(|info| info.client_id.ssh_agent_forward);
 
         clients.sort_by(|a, b| {
-            // The biggest last_input time is most recent, so it sorts sooner.
-            // However, when using a proxy into a gui mux, both the proxy and the
-            // gui will update around the same time, with the gui often being
-            // updated fractionally after the proxy.
-            // In this situation we want the proxy to be selected, so we weight
-            // proxy entries slightly higher by adding a small Duration to
-            // the actual observed value.
-            // `via proxy pid` is coupled with the Pdu::SetClientId logic
-            // in wezterm-mux-server-impl/src/sessionhandler.rs
+            // Biggest last_input wins. Bias proxies upward so that
+            // gui-via-proxy setups don't flap; matches the pairing in
+            // wezterm-mux-server-impl/src/sessionhandler.rs.
             const PROXY_MARKER: &str = "via proxy pid";
             let a_proxy = a.client_id.hostname.contains(PROXY_MARKER);
             let b_proxy = b.client_id.hostname.contains(PROXY_MARKER);
 
-            fn adjust_for_proxy(time: DateTime<Utc>, is_proxy: bool) -> DateTime<Utc> {
+            fn adjust(time: DateTime<Utc>, is_proxy: bool) -> DateTime<Utc> {
                 if is_proxy {
                     time + Duration::milliseconds(100)
                 } else {
@@ -173,62 +183,102 @@ impl AgentProxy {
                 }
             }
 
-            let a_time = adjust_for_proxy(a.last_input, a_proxy);
-            let b_time = adjust_for_proxy(b.last_input, b_proxy);
-
-            b_time.cmp(&a_time)
+            adjust(b.last_input, b_proxy).cmp(&adjust(a.last_input, a_proxy))
         });
 
-        log::trace!("filtered to {clients:#?}");
-        match clients.get(0) {
-            Some(info) => {
-                let current = self.current_target.read().clone();
-                let needs_update = match (current, &info.client_id) {
-                    (None, _) => true,
-                    (Some(prior), current) => prior != *current,
-                };
+        clients.into_iter().map(|info| info.client_id).next()
+    }
 
-                if needs_update {
-                    let ssh_auth_sock = info
-                        .client_id
-                        .ssh_auth_sock
-                        .as_ref()
-                        .expect("we checked in the retain above");
-                    log::trace!(
-                        "Will update {} -> {ssh_auth_sock}",
-                        self.sock_path.display(),
-                    );
-                    self.current_target.write().replace(info.client_id.clone());
-
-                    if let Err(err) = update_symlink(ssh_auth_sock, &self.sock_path) {
-                        log::error!(
-                            "Problem updating {} -> {ssh_auth_sock}: {err:#}",
-                            self.sock_path.display(),
-                        );
+    fn accept_loop(listener: UnixListener) {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    if let Some(mux) = Mux::try_get() {
+                        if let Some(agent) = &mux.agent {
+                            agent.handle_accepted(stream);
+                        }
                     }
                 }
+                Err(err) => {
+                    log::warn!("agent socket accept failed: {err:#}");
+                    // Brief pause so we don't spin on a persistent
+                    // error (e.g. EMFILE).
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
             }
+        }
+    }
+
+    fn handle_accepted(&self, stream: UnixStream) {
+        let Some(target) = self.pick_target_client() else {
+            log::debug!("agent: no forward-capable client available; dropping connection");
+            return;
+        };
+
+        let sender = match self.senders.read().get(target.as_ref()).cloned() {
+            Some(s) => s,
             None => {
-                if self.current_target.write().take().is_some() {
-                    if let Some(inherited) = Self::default_ssh_auth_sock() {
-                        log::trace!("Reverting agent to default {inherited}");
-                        if let Err(err) = update_symlink(&inherited, &self.sock_path) {
-                            log::error!(
-                                "Problem updating {} -> {inherited}: {err:#}",
-                                self.sock_path.display()
-                            );
-                        }
-                    } else {
-                        log::trace!("Updating agent to be bogus");
-                        if let Err(err) = update_symlink(".", &self.sock_path) {
-                            log::error!(
-                                "Problem updating {} -> .: {err:#}",
-                                self.sock_path.display()
-                            );
-                        }
-                    }
+                // Client was registered by client_id but its sender
+                // already went away; drop the connection.
+                return;
+            }
+        };
+
+        let read_half = match stream.try_clone() {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!("agent: try_clone failed: {err:#}");
+                return;
+            }
+        };
+
+        let channel_id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
+        self.channels.write().insert(
+            channel_id,
+            ChannelEntry {
+                write_half: Mutex::new(stream),
+                client_id: target.clone(),
+            },
+        );
+
+        sender(AgentMessage::Open { channel_id });
+
+        let sender_for_thread = sender.clone();
+        std::thread::spawn(move || {
+            Self::pump_local_to_remote(channel_id, read_half, sender_for_thread);
+            if let Some(mux) = Mux::try_get() {
+                if let Some(agent) = &mux.agent {
+                    agent.close_channel(channel_id, true);
+                }
+            }
+        });
+    }
+
+    fn pump_local_to_remote(channel_id: u64, mut stream: UnixStream, sender: AgentSender) {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    // Local side closed; let the remote know so it can
+                    // half-close its agent connection.
+                    sender(AgentMessage::Data {
+                        channel_id,
+                        data: Vec::new(),
+                    });
+                    return;
+                }
+                Ok(n) => {
+                    sender(AgentMessage::Data {
+                        channel_id,
+                        data: buf[..n].to_vec(),
+                    });
+                }
+                Err(err) => {
+                    log::debug!("agent channel {channel_id} read failed: {err:#}");
+                    return;
                 }
             }
         }
     }
 }
+

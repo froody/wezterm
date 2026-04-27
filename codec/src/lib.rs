@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+pub const CODEC_VERSION: usize = 46;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -502,6 +502,9 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    OpenAgentChannel: 63,
+    AgentChannelData: 64,
+    CloseAgentChannel: 65,
 }
 
 impl Pdu {
@@ -834,6 +837,28 @@ pub struct WindowWorkspaceChanged {
 pub struct SetClientId {
     pub client_id: ClientId,
     pub is_proxy: bool,
+}
+
+/// Sent unilaterally (serial=0) by the server to a client when something
+/// on the server-side has connected to the agent socket and needs the
+/// client to bridge data to its local SSH agent.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct OpenAgentChannel {
+    pub channel_id: u64,
+}
+
+/// Bidirectional unilateral PDU carrying agent traffic for an open channel.
+/// An empty `data` payload signals EOF in the sending direction.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct AgentChannelData {
+    pub channel_id: u64,
+    pub data: Vec<u8>,
+}
+
+/// Bidirectional unilateral PDU indicating the channel is closed.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct CloseAgentChannel {
+    pub channel_id: u64,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
