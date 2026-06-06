@@ -466,6 +466,8 @@ impl ClientDomain {
     pub async fn reattach(domain_id: DomainId, ui: ConnectionUI) -> anyhow::Result<()> {
         let inner = Self::get_client_inner_for_domain(domain_id)?;
 
+        inner.client.verify_version_compat(&ui).await?;
+
         let panes = inner.client.list_panes().await?;
         Self::process_pane_list(inner, panes, None)?;
 
