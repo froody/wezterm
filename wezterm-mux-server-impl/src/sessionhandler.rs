@@ -201,15 +201,17 @@ pub struct SessionHandler {
     per_pane: HashMap<TabId, Arc<Mutex<PerPane>>>,
     client_id: Option<Arc<ClientId>>,
     proxy_client_id: Option<ClientId>,
+    session_id: u64,
 }
 
 impl Drop for SessionHandler {
     fn drop(&mut self) {
         if let Some(client_id) = self.client_id.take() {
             let mux = Mux::get();
-            mux.unregister_client(&client_id);
-            if let Some(agent) = &mux.agent {
-                agent.unregister_client(&client_id);
+            if mux.unregister_session(&client_id, self.session_id) {
+                if let Some(agent) = &mux.agent {
+                    agent.unregister_client(&client_id);
+                }
             }
         }
     }
@@ -237,11 +239,13 @@ fn agent_sender_for(sender: PduSender) -> mux::ssh_agent::AgentSender {
 
 impl SessionHandler {
     pub fn new(to_write_tx: PduSender) -> Self {
+        let session_id = crate::NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             to_write_tx,
             per_pane: HashMap::new(),
             client_id: None,
             proxy_client_id: None,
+            session_id,
         }
     }
 
@@ -349,9 +353,10 @@ impl SessionHandler {
                         None
                     };
                     let cid_for_register = client_id.clone();
+                    let session_id = self.session_id;
                     spawn_into_main_thread(async move {
                         let mux = Mux::get();
-                        mux.register_client(cid_for_register.clone());
+                        mux.register_client(cid_for_register.clone(), Some(session_id));
                         if let (Some(sender), Some(agent)) = (agent_sender, mux.agent.as_ref()) {
                             agent.register_client((*cid_for_register).clone(), sender);
                         }

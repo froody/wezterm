@@ -64,6 +64,8 @@ pub struct ClientInfo {
     pub last_input: DateTime<Utc>,
     /// The currently-focused pane
     pub focused_pane_id: Option<PaneId>,
+    #[serde(default)]
+    pub session_ids: std::collections::HashSet<u64>,
 }
 
 impl ClientInfo {
@@ -74,6 +76,7 @@ impl ClientInfo {
             active_workspace: None,
             last_input: Utc::now(),
             focused_pane_id: None,
+            session_ids: std::collections::HashSet::new(),
         }
     }
 

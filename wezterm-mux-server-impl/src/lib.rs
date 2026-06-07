@@ -110,4 +110,5 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
 
 lazy_static::lazy_static! {
     pub static ref PKI: pki::Pki = pki::Pki::init().expect("failed to initialize PKI");
+    static ref NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 }

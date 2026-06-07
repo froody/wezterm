@@ -165,7 +165,9 @@ impl AgentProxy {
 
     fn pick_target_client(&self) -> Option<Arc<ClientId>> {
         let mut clients = Mux::get().iter_clients();
+        log::info!("pick_target_client: all clients in mux: {:#?}", clients);
         clients.retain(|info| info.client_id.ssh_agent_forward);
+        log::info!("pick_target_client: clients after forward filter: {:#?}", clients);
 
         clients.sort_by(|a, b| {
             // Biggest last_input wins. Bias proxies upward so that
@@ -186,7 +188,9 @@ impl AgentProxy {
             adjust(b.last_input, b_proxy).cmp(&adjust(a.last_input, a_proxy))
         });
 
-        clients.into_iter().map(|info| info.client_id).next()
+        let picked = clients.into_iter().map(|info| info.client_id).next();
+        log::info!("pick_target_client: picked: {:#?}", picked);
+        picked
     }
 
     fn accept_loop(listener: UnixListener) {
@@ -210,19 +214,24 @@ impl AgentProxy {
     }
 
     fn handle_accepted(&self, stream: UnixStream) {
+        log::info!("handle_accepted: new connection to agent socket!");
+        let senders_keys: Vec<_> = self.senders.read().keys().cloned().collect();
+        log::info!("handle_accepted: registered senders: {:#?}", senders_keys);
         let Some(target) = self.pick_target_client() else {
-            log::debug!("agent: no forward-capable client available; dropping connection");
+            log::warn!("agent: no forward-capable client available; dropping connection");
             return;
         };
 
         let sender = match self.senders.read().get(target.as_ref()).cloned() {
             Some(s) => s,
             None => {
+                log::warn!("agent: picked client {:#?} but its sender already went away; dropping connection", target);
                 // Client was registered by client_id but its sender
                 // already went away; drop the connection.
                 return;
             }
         };
+        log::info!("handle_accepted: successfully picked sender for {:#?}", target);
 
         let read_half = match stream.try_clone() {
             Ok(s) => s,

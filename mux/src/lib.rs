@@ -564,10 +564,14 @@ impl Mux {
         Ok(())
     }
 
-    pub fn register_client(&self, client_id: Arc<ClientId>) {
-        self.clients
-            .write()
-            .insert((*client_id).clone(), ClientInfo::new(client_id));
+    pub fn register_client(&self, client_id: Arc<ClientId>, session_id: Option<u64>) {
+        let mut clients = self.clients.write();
+        let info = clients
+            .entry((*client_id).clone())
+            .or_insert_with(|| ClientInfo::new(client_id.clone()));
+        if let Some(sid) = session_id {
+            info.session_ids.insert(sid);
+        }
     }
 
     pub fn iter_clients(&self) -> Vec<ClientInfo> {
@@ -687,6 +691,18 @@ impl Mux {
 
     pub fn unregister_client(&self, client_id: &ClientId) {
         self.clients.write().remove(client_id);
+    }
+
+    pub fn unregister_session(&self, client_id: &ClientId, session_id: u64) -> bool {
+        let mut clients = self.clients.write();
+        if let Some(info) = clients.get_mut(client_id) {
+            info.session_ids.remove(&session_id);
+            if info.session_ids.is_empty() {
+                clients.remove(client_id);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn subscribe<F>(&self, subscriber: F)
